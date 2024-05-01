@@ -2,16 +2,19 @@ using Microsoft.EntityFrameworkCore;
 using UsersManager.Data;
 using UsersManager.Enums;
 using UsersManager.Models;
+using UsersManager.Services.SenhaService;
 
 namespace UsersManager.Services;
 
 public class UserService : IUserInterface
 {
     private readonly AppDbContext _context;
+    private readonly ISenhaInterface _senhaInterface;
 
-    public UserService(AppDbContext context)
+    public UserService(AppDbContext context, ISenhaInterface senhaInterface)
     {
         _context = context;
+        _senhaInterface = senhaInterface;
     }
     
     public async Task<ResponseModel<List<UserModel>>> GetUsers()
@@ -69,20 +72,36 @@ public class UserService : IUserInterface
         }
     }
 
-    public async Task<ResponseModel<UserModel>> CreateUser(UserDTO newUser)
+    public async Task<ResponseModel<UserModel>> CreateUser(UserCreateDTO newUserCreate)
     {
         ResponseModel<UserModel> response = new ResponseModel<UserModel>();
         
         try
         {
-            response = ValidateNewUser(newUser);
+            response = await UserEmailExist(newUserCreate);
             if (!response.Status)
             {
                 return response;
             }
             
-            Acesso nivelAcesso = (Acesso)Enum.Parse(typeof(Acesso), newUser.NivelAcesso);
-            UserModel user = new UserModel(newUser.Nome, newUser.Sobrenome, newUser.Email, newUser.Senha, nivelAcesso);
+            response = await userAdmin(newUserCreate.IdUserAlter);
+            if (!response.Status)
+            {
+                return response;
+            }
+
+            _senhaInterface.CriarSenhaHash(newUserCreate.Senha, out byte[] senhaHash, out byte[] senhaSalt);
+
+            UserModel user = new UserModel()
+            {
+                Nome = newUserCreate.Nome,
+                Sobrenome = newUserCreate.Sobrenome,
+                Email = newUserCreate.Email,
+                NivelAcesso = newUserCreate.NivelAcesso,
+                SenhaHash = senhaHash,
+                SenhaSalt = senhaSalt,
+                IdUserUpdate = newUserCreate.IdUserAlter
+            };
 
             _context.Add(user);
             await _context.SaveChangesAsync();
@@ -99,14 +118,13 @@ public class UserService : IUserInterface
         }
     }
 
-    public async Task<ResponseModel<UserModel>> UpdateUser(int id, UserDTO updateUser)
+    public async Task<ResponseModel<UserModel>> UpdateUser(UserUpdateDTO updateUser)
     {
         ResponseModel<UserModel> response = new ResponseModel<UserModel>();
         
         try
         {
-            UserModel user = await _context.Users.FirstOrDefaultAsync(x => x.Id == id);
-            
+            UserModel user = await _context.Users.FirstOrDefaultAsync(x => x.Id == updateUser.IdUser);
             if (user == null)
             {
                 response.Data = null;
@@ -120,6 +138,12 @@ public class UserService : IUserInterface
             {
                 return response;
             }
+            
+            response = await userAdmin(updateUser.IdUserAlter);
+            if (!response.Status)
+            {
+                return response;
+            }
 
             if (updateUser.Nome != null)
                 user.Nome = updateUser.Nome;
@@ -128,14 +152,22 @@ public class UserService : IUserInterface
             if (updateUser.Email != null)
                 user.Email = updateUser.Email;
             if (updateUser.Senha != null)
-                user.Senha = updateUser.Senha;
+            {
+                _senhaInterface.CriarSenhaHash(updateUser.Senha, out byte[] senhaHash, out byte[] senhaSalt);
+                user.SenhaHash = senhaHash;
+                user.SenhaSalt = senhaSalt;
+            }
+
             if (updateUser.NivelAcesso != null)
                 user.NivelAcesso = (Acesso)Enum.Parse(typeof(Acesso), updateUser.NivelAcesso);
+            
+            user.IdUserUpdate = updateUser.IdUserAlter;
+            user.UpdateAt = DateTime.UtcNow;
 
             _context.Update(user);
             await _context.SaveChangesAsync();
 
-            response.Data = await _context.Users.FirstOrDefaultAsync(x => x.Id == id);
+            response.Data = await _context.Users.FirstOrDefaultAsync(x => x.Id == updateUser.IdUser);
             response.Message = "Success.";
 
             return response;
@@ -148,21 +180,35 @@ public class UserService : IUserInterface
         }
     }
 
-    public async Task<ResponseModel<UserModel>> DeleteUser(int id)
+    public async Task<ResponseModel<UserModel>> DeleteUser(UserDeleteDTO userDeleteDto)
     {
         ResponseModel<UserModel> response = new ResponseModel<UserModel>();
 
         try
         {
-            var user = await _context.Users.FirstOrDefaultAsync(x => x.Id == id);
-
+            var user = await _context.Users.FirstOrDefaultAsync(x => x.Id == userDeleteDto.IdUserDelete);
             if(user == null)
             {
                 response.Message = "Usuário não encontrado.";
                 return response;
             }
 
-            _context.Remove(user);
+            response = await userAdminMaster(user.Id);
+            if (!response.Status)
+            {
+                return response;
+            }
+
+            response = await userAdmin(userDeleteDto.IdUserAlter);
+            if (!response.Status)
+            {
+                return response;
+            }
+
+            user.IdUserUpdate = userDeleteDto.IdUserAlter;
+            user.UpdateAt = DateTime.UtcNow;
+            user.Ativo = false;
+            _context.Update(user);
             await _context.SaveChangesAsync();
 
             response.Data = null;
@@ -178,45 +224,64 @@ public class UserService : IUserInterface
         }
     }
 
-    public ResponseModel<UserModel> ValidateNewUser(UserDTO newUser)
+    public async Task<ResponseModel<UserModel>> userAdminMaster(int id)
     {
         ResponseModel<UserModel> response = new ResponseModel<UserModel>();
-        
-        if (newUser.Nome == null)
+        UserModel user = await _context.Users.FirstOrDefaultAsync(x => x.Id == id);
+        if ((user.Id == 1) && (user.Nome == "admin") && (user.NivelAcesso == Acesso.ADMIN))
         {
             response.Data = null;
-            response.Message = "Nome é obrigatório";
             response.Status = false;
+            response.Message = "Usuário ADMIN não pode ser alterado!";
         }
-        if (newUser.Sobrenome == null)
+        else
         {
             response.Data = null;
-            response.Message = response.Message + ", Sobrenome é obrigatório";
-            response.Status = false;
+            response.Status = true;
+            response.Message = "Success";
         }
-        if (newUser.Email == null)
+        return response;
+    }
+    
+    public async Task<ResponseModel<UserModel>> userAdmin(int id)
+    {
+        ResponseModel<UserModel> response = new ResponseModel<UserModel>();
+        UserModel user = await _context.Users.FirstOrDefaultAsync(x => x.Id == id);
+        if (user.NivelAcesso == Acesso.ADMIN)
         {
             response.Data = null;
-            response.Message = response.Message + ", Email é obrigatório";
-            response.Status = false;
+            response.Status = true;
+            response.Message = "Success";
         }
-        if (newUser.Senha == null)
+        else
         {
             response.Data = null;
-            response.Message = response.Message + ", Senha é obrigatório";
             response.Status = false;
+            response.Message = "Usuário sem privilégios para esta ação.";
         }
-        if (newUser.NivelAcesso == null)
+        return response;
+    }
+    
+    public async Task<ResponseModel<UserModel>> UserEmailExist(UserCreateDTO newUserCreate)
+    {
+        ResponseModel<UserModel> response = new ResponseModel<UserModel>();
+        var user = await _context.Users.FirstOrDefaultAsync(x => x.Email == newUserCreate.Email);
+        if (user != null)
         {
             response.Data = null;
-            response.Message = response.Message + ", NivelAcesso é obrigatório COMUM ou ADMIN";
             response.Status = false;
+            response.Message = "Email já cadastrado para outro usuário!";
         }
-
+        else
+        {
+            response.Data = null;
+            response.Status = true;
+            response.Message = "Success";
+        }
         return response;
     }
 
-    public ResponseModel<UserModel> ValidateUpdateUser(UserDTO updateUser)
+    public ResponseModel<UserModel> ValidateUpdateUser(UserUpdateDTO updateUser)
     {
         ResponseModel<UserModel> response = new ResponseModel<UserModel>();
 
